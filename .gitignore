@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyo
+assistant/assistant.log
+assistant/assistant.lock
+*.log
