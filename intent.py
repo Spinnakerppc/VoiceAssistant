@@ -6,11 +6,18 @@ import logging
 import datetime
 import sqlite3
 import os
+import urllib.request
+import json
 
 log = logging.getLogger(__name__)
 
-# IoT database path (from iot_env_config_10.py)
+# IoT database path
 IOT_DB = os.path.expanduser("~/iot_app_data/database/sensor_data.db")
+
+# Default location for weather (Open-Meteo — free, no API key)
+WEATHER_LAT  = 34.7304
+WEATHER_LON  = -86.5861
+WEATHER_CITY = "Huntsville, AL"
 
 
 # ---------------------------------------------------------------------------
@@ -25,6 +32,70 @@ def handle_time(_: str) -> str:
 def handle_date(_: str) -> str:
     now = datetime.datetime.now()
     return f"Today is {now.strftime('%A, %B %d, %Y')}."
+
+
+def handle_weather(text: str) -> str:
+    """Fetch current weather from Open-Meteo (free, no API key needed)."""
+    try:
+        url = (
+            f"https://api.open-meteo.com/v1/forecast"
+            f"?latitude={WEATHER_LAT}&longitude={WEATHER_LON}"
+            f"&current_weather=true"
+            f"&hourly=relativehumidity_2m,apparent_temperature,precipitation_probability,weathercode"
+            f"&temperature_unit=fahrenheit&windspeed_unit=mph&forecast_days=1"
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "CannaKitAssistant/1.0"})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            data = json.loads(resp.read().decode())
+
+        cw       = data["current_weather"]
+        temp_f   = round(cw["temperature"])
+        wind_mph = round(cw["windspeed"])
+        wcode    = cw["weathercode"]
+
+        # Humidity and feels-like from first hourly slot
+        humidity   = data["hourly"]["relativehumidity_2m"][0]
+        feels_like = round(data["hourly"]["apparent_temperature"][0])
+        precip_pct = data["hourly"]["precipitation_probability"][0]
+
+        # Human-readable condition from WMO weather code
+        CONDITIONS = {
+            0: "clear skies", 1: "mainly clear", 2: "partly cloudy", 3: "overcast",
+            45: "foggy", 48: "icy fog",
+            51: "light drizzle", 53: "drizzle", 55: "heavy drizzle",
+            61: "light rain", 63: "rain", 65: "heavy rain",
+            71: "light snow", 73: "snow", 75: "heavy snow",
+            80: "rain showers", 81: "showers", 82: "heavy showers",
+            95: "thunderstorms", 96: "thunderstorms with hail",
+        }
+        condition = CONDITIONS.get(wcode, f"weather code {wcode}")
+
+        text_lower = text.lower()
+
+        # Specific sub-queries
+        if "rain" in text_lower or "umbrella" in text_lower:
+            if precip_pct >= 50:
+                return f"Yes, there's a {precip_pct}% chance of rain in {WEATHER_CITY}. Bring an umbrella."
+            else:
+                return f"Probably not — only a {precip_pct}% chance of rain in {WEATHER_CITY}."
+
+        if "wind" in text_lower:
+            return f"Wind speed in {WEATHER_CITY} is {wind_mph} miles per hour."
+
+        if "humid" in text_lower:
+            return f"Humidity in {WEATHER_CITY} is {humidity}%."
+
+        # Full conditions (default)
+        return (
+            f"Current weather in {WEATHER_CITY}: {condition}, "
+            f"{temp_f} degrees, feels like {feels_like}. "
+            f"Humidity {humidity}%, wind {wind_mph} miles per hour. "
+            f"Chance of rain: {precip_pct}%."
+        )
+
+    except Exception as e:
+        log.error(f"[INTENT] Weather error: {e}")
+        return "I couldn't fetch the weather right now. Check your internet connection."
 
 
 def handle_sensor(text: str) -> str:
@@ -87,11 +158,24 @@ def handle_status(_: str) -> str:
         return "I couldn't check the system status right now."
 
 
+def handle_nas_search(text: str) -> str:
+    """Delegate to nas_search module."""
+    try:
+        from nas_search import handle_nas_search as _search
+        return _search(text)
+    except ImportError:
+        log.error("[INTENT] nas_search.py not found — place it alongside intent.py")
+        return "NAS search module is not installed."
+    except Exception as e:
+        log.error(f"[INTENT] NAS search error: {e}")
+        return "Something went wrong while searching the NAS."
+
+
 def handle_help(_: str) -> str:
     return (
-        "You can ask me: what time is it, what's the temperature, "
-        "what's the humidity, system status, or just say hey cannakit "
-        "followed by your question."
+        "You can ask me: what time is it, what's the weather, "
+        "what's the temperature inside, humidity, system status, "
+        "find a file on the NAS, or say hey Jarvis followed by your question."
     )
 
 
@@ -101,16 +185,23 @@ def handle_unknown(text: str) -> str:
 
 # ---------------------------------------------------------------------------
 # Intent routing table
+# NOTE: weather is checked BEFORE sensor so "temperature outside" / "how hot
+# is it" routes to weather, not the IoT database.
 # ---------------------------------------------------------------------------
 
 INTENTS = [
-    (["what time", "what's the time", "current time"],          handle_time),
-    (["what day", "what date", "today's date", "what's today"], handle_date),
+    (["what time", "what's the time", "current time"],              handle_time),
+    (["what day", "what date", "today's date", "what's today"],     handle_date),
+    (["weather", "forecast", "outside", "raining", "umbrella",
+      "wind speed", "how hot", "how cold", "what's it like"],       handle_weather),
     (["temperature", "temp", "humidity", "pressure",
-      "bilge", "motion", "sound", "battery", "sensor"],         handle_sensor),
+      "bilge", "motion", "sound", "battery", "sensor"],             handle_sensor),
     (["status", "how are you", "everything okay",
-      "systems", "services running"],                            handle_status),
-    (["help", "what can you do", "commands"],                    handle_help),
+      "systems", "services running"],                                handle_status),
+    (["find", "search for", "look for", "locate",
+      "do you have", "is there a file", "open the file",
+      "show me the file"],                                           handle_nas_search),
+    (["help", "what can you do", "commands"],                       handle_help),
 ]
 
 
@@ -131,11 +222,14 @@ def route(text: str) -> str:
 
 
 if __name__ == "__main__":
-    # Quick test
     tests = [
         "what time is it",
+        "what's the weather",
+        "is it raining",
+        "wind speed",
         "what's the temperature",
         "system status",
+        "find the lease agreement",
         "tell me a joke",
     ]
     for t in tests:

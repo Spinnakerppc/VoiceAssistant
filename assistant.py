@@ -1,184 +1,167 @@
-#!/usr/bin/env python3
 """
-assistant.py — CannaKit Voice Assistant (Push-to-Talk mode)
-Press F12 to start recording, release to process and respond.
-Run with: sudo ~/app/assistant/venv/bin/python3 ~/app/assistant.py
+assistant.py — Main voice assistant loop
+F12 key → STT → Intent → TTS
 """
-import logging
 import threading
 import time
 import sys
 import os
+import logging
+import fcntl
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("/home/pi/app/assistant/assistant.log"),
-    ]
-)
-log = logging.getLogger("assistant")
-
-sys.path.insert(0, os.path.dirname(__file__))
+# Module-level so all threads can access them
+import sys as _sys
+_sys.path.insert(0, '/home/pi/app')
 import tts
 import stt
 import intent
-import keyboard
-import subprocess
-import numpy as np
-import pyaudio
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-HOTKEY        = "f12"
-PYAUDIO_INDEX = 1  # hw:2,0 Fifine      # pulse device
-SAMPLE_RATE   = 44100
-MAX_RECORD_S  = 10     # max recording duration in seconds
-
-# ---------------------------------------------------------------------------
-# State
-# ---------------------------------------------------------------------------
 STATE_IDLE       = "idle"
-STATE_RECORDING  = "recording"
+STATE_LISTENING  = "listening"
 STATE_PROCESSING = "processing"
 STATE_SPEAKING   = "speaking"
 
 state      = STATE_IDLE
 state_lock = threading.Lock()
+log        = logging.getLogger("assistant")
 
-def set_state(s):
+
+def set_state(new_state: str):
     global state
     with state_lock:
-        state = s
-    log.info(f"[STATE] → {s}")
+        state = new_state
+    log.info(f"[STATE] → {new_state}")
 
-# ---------------------------------------------------------------------------
-# Push-to-talk recording
-# ---------------------------------------------------------------------------
 
-def record_while_held(max_seconds=MAX_RECORD_S):
-    """Record audio while F12 is held down using pw-record as pi user."""
-    import tempfile
-    import uuid
-    wav_path = f"/tmp/cannakit_rec_{uuid.uuid4().hex[:8]}.wav"
-    # Create as world-writable so pi user can write to it
-    open(wav_path, 'wb').close()
-    os.chmod(wav_path, 0o666)
-
-    log.info("[PTT] Recording...")
-    proc = subprocess.Popen(
-        ["sudo", "-u", "pi", "env", "XDG_RUNTIME_DIR=/run/user/1000",
-         "pw-record", "--target", "82",
-         "--rate", "16000", "--channels", "1", wav_path],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-    start = time.time()
-    while keyboard.is_pressed(HOTKEY) and (time.time() - start) < max_seconds:
-        time.sleep(0.05)
-    proc.terminate()
-    try:
-        proc.wait(timeout=2)
-    except Exception:
-        proc.kill()
-    time.sleep(0.3)  # let pw-record flush and finalize WAV header
-    duration = time.time() - start
-    log.info(f"[PTT] Recorded {duration:.1f}s")
-    return wav_path, duration
-    return b"".join(frames), duration
-
-def save_wav(raw_bytes, path):
-    import wave
-    with wave.open(path, 'wb') as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)  # 16-bit
-        wf.setframerate(SAMPLE_RATE)
-        wf.writeframes(raw_bytes)
-
-# ---------------------------------------------------------------------------
-# Main pipeline
-# ---------------------------------------------------------------------------
-
-def on_f12_press():
+def on_trigger():
+    import sys
+    if "/home/pi/app" not in sys.path:
+        sys.path.insert(0, "/home/pi/app")
     global state
     with state_lock:
         if state != STATE_IDLE:
-            log.info("[PTT] Busy — ignoring keypress")
+            log.info("[ASSISTANT] Trigger ignored — not idle")
             return
-    set_state(STATE_RECORDING)
-
+        set_state(STATE_LISTENING)
+    log.info("[ASSISTANT] F12 trigger — starting pipeline")
     try:
-        # 1. Record while key held
-        wav_path, duration = record_while_held()
-
-        if duration < 0.5:
-            tts.speak("Too short — please hold F12 while speaking.")
-            return
-
-        # 2. Save to temp wav
-        import tempfile
-
-        # 3. Transcribe
-        set_state(STATE_PROCESSING)
-        tts.speak("Processing...")
-        command = stt.transcribe(wav_path)
-
+        set_state(STATE_SPEAKING)
+        tts.speak("Yes?")
+        set_state(STATE_LISTENING)
+        log.info("[ASSISTANT] Listening for command...")
+        command = stt.listen_and_transcribe(duration=6)
         if not command.strip():
             tts.speak("I didn't catch that. Please try again.")
             return
-
-        log.info(f"[PTT] Command: {command!r}")
-
-        # 4. Route intent
+        log.info(f"[ASSISTANT] Command: {command!r}")
+        set_state(STATE_PROCESSING)
         response = intent.route(command)
-        log.info(f"[PTT] Response: {response!r}")
-
-        # 5. Speak response
+        log.info(f"[ASSISTANT] Response: {response!r}")
         set_state(STATE_SPEAKING)
         tts.speak(response)
-
     except Exception as e:
-        log.error(f"[PTT] Pipeline error: {e}")
+        import traceback
+        log.error(f"[ASSISTANT] Pipeline error: {e}")
+        log.error(traceback.format_exc())
+        print(f"ERROR: {e}", flush=True)
+        import traceback as tb; print(tb.format_exc(), flush=True)
         try:
             tts.speak("Sorry, something went wrong.")
         except Exception:
             pass
     finally:
         set_state(STATE_IDLE)
-        log.info(f"[PTT] Ready — press {HOTKEY.upper()} to speak.")
+        log.info("[ASSISTANT] Ready.")
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+
+def f12_listener():
+    import struct
+    import glob
+    import select
+    KEY_F12   = 88
+    EV_KEY    = 1
+    KEY_PRESS = 1
+    devices = glob.glob("/dev/input/event*")
+    fds = []
+    for dev in devices:
+        try:
+            fds.append(open(dev, "rb"))
+        except PermissionError:
+            pass
+    if not fds:
+        log.error("[F12] No readable input devices — check input group membership")
+        return
+    log.info(f"[F12] Monitoring {len(fds)} input device(s) for F12...")
+    event_size = struct.calcsize("llHHI")
+    while True:
+        readable, _, _ = select.select(fds, [], [], 1.0)
+        for f in readable:
+            try:
+                data = f.read(event_size)
+                if len(data) < event_size:
+                    continue
+                _, _, ev_type, ev_code, ev_value = struct.unpack("llHHI", data)
+                if ev_type == EV_KEY and ev_code == KEY_F12 and ev_value == KEY_PRESS:
+                    with state_lock:
+                        if state != STATE_IDLE: continue
+                    log.info("[F12] F12 pressed — triggering assistant")
+                    threading.Thread(target=on_trigger, daemon=True).start()
+            except Exception:
+                pass
+
+
+LOCK_FILE = os.path.expanduser("~/app/assistant/assistant.lock")
+
+
+def acquire_lock():
+    os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
+    fh = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("[ASSISTANT] Another instance is already running. Exiting.", flush=True)
+        sys.exit(1)
+    fh.write(str(os.getpid()))
+    fh.flush()
+    return fh
+
+
+def setup_logging():
+    sys.stdout.reconfigure(line_buffering=True)
+    log_dir = os.path.expanduser("~/app/assistant")
+    os.makedirs(log_dir, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(os.path.join(log_dir, "assistant.log")),
+        ],
+        force=True,
+    )
+
 
 def main():
+    _lock = acquire_lock()
+    setup_logging()
     log.info("=" * 50)
-    log.info("  CannaKit Voice Assistant — Push-to-Talk")
+    log.info("  CannaKit Voice Assistant Starting")
     log.info("=" * 50)
-
-    # Pre-load Whisper
-    log.info("[ASSISTANT] Loading Whisper model...")
+    log.info("[ASSISTANT] Loading Whisper model (first run may take a moment)...")
     stt._get_model()
     log.info("[ASSISTANT] Whisper ready.")
-
-    tts.speak(f"CannaKit ready. Hold {HOTKEY.upper()} and speak your command.")
-
-    # Register hotkey
-    keyboard.on_press_key(HOTKEY, lambda _: threading.Thread(
-        target=on_f12_press, daemon=True).start())
-
-    log.info(f"[ASSISTANT] Listening for {HOTKEY.upper()} keypress. Ctrl+C to quit.")
-
+    tts.speak("CannaKit voice assistant ready. Press F12 to begin.")
+    t = threading.Thread(target=f12_listener, daemon=True)
+    t.start()
+    log.info("[ASSISTANT] Listening for F12 keypress. Ctrl+C to quit.")
     try:
         while True:
-            time.sleep(0.1)
+            time.sleep(1)
     except KeyboardInterrupt:
         log.info("[ASSISTANT] Shutting down...")
         tts.speak("Goodbye.")
+        log.info("[ASSISTANT] Stopped.")
+
 
 if __name__ == "__main__":
     main()
