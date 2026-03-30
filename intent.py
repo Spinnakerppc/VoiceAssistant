@@ -180,7 +180,24 @@ def handle_help(_: str) -> str:
 
 
 def handle_unknown(text: str) -> str:
-    return f"I heard you say: {text}. I'm not sure how to help with that yet."
+    try:
+        import urllib.request, json
+        payload = json.dumps({
+            "model": "qwen2.5:1.5b",
+            "prompt": f"You are a helpful voice assistant. Answer briefly in 1-2 sentences: {text}",
+            "stream": False
+        }).encode()
+        req = urllib.request.Request(
+            "http://localhost:11434/api/generate",
+            data=payload,
+            headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+            return data.get("response", "I am not sure how to help with that.").strip()
+    except Exception as e:
+        log.error(f"[INTENT] LLM error: {e}")
+        return f"I heard you say: {text}. I am not sure how to help with that yet."
 
 
 # ---------------------------------------------------------------------------

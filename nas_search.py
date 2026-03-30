@@ -137,6 +137,22 @@ def search_nas(query, content_search=True):
 
 
 def _extract_search_query(text):
+    import re as _re
+    # Strip common filler phrases first
+    text = text.lower().strip().rstrip("?.")
+    fillers = [
+        r"any file[s]? on (?:the )?(?:nas|network attached storage|network|storage)[\w\s]*that contains? (?:the )?word\s+",
+        r"any file[s]? on (?:the )?(?:nas|network attached storage|network|storage)[\w\s]*",
+        r"that contains? (?:the )?word\s+",
+        r"on (?:the )?(?:nas|network|storage)",
+        r"(?:find me|find|search for|look for|locate|search)\s+",
+        r"(?:the |a |my )",
+    ]
+    for f in fillers:
+        text = _re.sub(f, " ", text).strip()
+    text = " ".join(text.split())  # collapse whitespace
+    if text:
+        return text
     patterns = [
         r"(?:find|search for|look for|locate|find me|search)\s+(?:the\s+|a\s+|my\s+)?(.+)",
         r"(?:do you have|is there)\s+(?:a\s+|the\s+)?(?:file called|document called|file named)?\s*(.+)",
