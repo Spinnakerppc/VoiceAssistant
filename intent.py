@@ -171,6 +171,30 @@ def handle_nas_search(text: str) -> str:
         return "Something went wrong while searching the NAS."
 
 
+def handle_telegram(text: str) -> str:
+    """Send a message via Telegram bot."""
+    import re
+    BOT_TOKEN = "8556340619:AAGSIZcC7fuztIxvndQ45TucnD-OCA59m9I"
+    CHAT_ID   = "6874200753"
+    pattern = r"(?:send|text|message|tell)\s+(?:a\s+)?(?:message\s+)?(?:to\s+)?(?:telegram\s+)?(?:saying|that|:)?\s*(.+)"
+    m = re.search(pattern, text.lower())
+    message = m.group(1).strip() if m else text
+    try:
+        import urllib.request, json
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        payload = json.dumps({"chat_id": CHAT_ID, "text": message}).encode()
+        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+            if data.get("ok"):
+                return f"Message sent: {message}"
+            else:
+                return "Failed to send the Telegram message."
+    except Exception as e:
+        log.error(f"[INTENT] Telegram error: {e}")
+        return "I could not send the Telegram message right now."
+
+
 def handle_help(_: str) -> str:
     return (
         "You can ask me: what time is it, what's the weather, "
@@ -207,6 +231,8 @@ def handle_unknown(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 INTENTS = [
+    (["send a message", "text me", "send telegram", "message saying",
+      "tell telegram", "send message"],                              handle_telegram),
     (["what time", "what's the time", "current time"],              handle_time),
     (["what day", "what date", "today's date", "what's today"],     handle_date),
     (["weather", "forecast", "outside", "raining", "umbrella",
